@@ -7,12 +7,13 @@ Node.js/TypeScript SDK for Senzing v4 entity resolution, built with NAPI-RS.
 
 ## Overview
 
-This monorepo provides two npm packages:
+This monorepo provides three npm packages:
 
 - **`@senzing/sdk`** -- Runtime bindings for the Senzing entity resolution engine. Add records, resolve entities, search by attributes, analyze relationships, and manage configurations.
 - **`@senzing/configtool`** -- Pure JSON manipulation of Senzing configuration documents. No Senzing runtime needed. Works anywhere Node.js runs.
+- **`@senzing/electron`** -- Senzing Desktop SDK. Exposes the entire `@senzing/sdk` API to Electron renderer processes via `contextBridge`/IPC with zero network transport.
 
-Both packages are built with [NAPI-RS](https://napi.rs) (Rust native bindings), providing full TypeScript type definitions generated from Rust source code and prebuilt native binaries for all supported platforms.
+The SDK and configtool packages are built with [NAPI-RS](https://napi.rs) (Rust native bindings), providing full TypeScript type definitions generated from Rust source code and prebuilt native binaries for all supported platforms.
 
 ## Prerequisites
 
@@ -57,6 +58,7 @@ scoop install senzingsdk-runtime-unofficial
 ```bash
 npm install @senzing/sdk
 npm install @senzing/configtool
+npm install @senzing/electron   # For Electron desktop apps
 ```
 
 Each package uses platform-specific optional dependencies so npm installs only the binary for your OS and architecture.
@@ -122,6 +124,79 @@ console.log(sources);
 writeFileSync("config-modified.json", config);
 ```
 
+### Electron Desktop SDK: Build Web UIs with No Server
+
+The `@senzing/electron` package lets you build web interfaces that talk directly to a Senzing install -- no ports, no gRPC, no HTTP. The SDK runs in a worker thread and is exposed to the renderer via Electron's `contextBridge`.
+
+**Architecture:**
+
+```
+Renderer (web UI)  -->  contextBridge/IPC  -->  Main process  -->  worker_threads  -->  @senzing/sdk native
+```
+
+**Main process** (3 lines of Senzing code):
+
+```typescript
+import { app, BrowserWindow } from "electron";
+import { SzElectronMain } from "@senzing/electron/main";
+
+const sz = new SzElectronMain();
+
+app.whenReady().then(() => {
+  sz.setup();
+  const win = new BrowserWindow({
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  win.loadFile("index.html");
+});
+
+app.on("window-all-closed", async () => {
+  await sz.teardown();
+  app.quit();
+});
+```
+
+**Preload script** (1 line):
+
+```typescript
+import "@senzing/electron/preload";
+```
+
+**Renderer / web UI** (just call `window.senzing`):
+
+```typescript
+// Initialize with Senzing settings
+await window.senzing.initialize(settingsJson);
+
+// All SDK methods available as async calls
+const version = await window.senzing.product.getVersion();
+console.log(JSON.parse(version));
+
+// Add a record with WITH_INFO flag
+const info = await window.senzing.engine.addRecord(
+  "CUSTOMERS",
+  "1001",
+  JSON.stringify({ NAME_FULL: "Robert Smith" }),
+  window.senzing.flags.WITH_INFO,
+);
+
+// Search
+const results = await window.senzing.engine.searchByAttributes(
+  JSON.stringify({ NAME_FULL: "Bob Smith" }),
+);
+
+// Cleanup
+await window.senzing.destroy();
+```
+
+**TypeScript support:** Add `/// <reference types="@senzing/electron/renderer" />` to get full autocomplete for `window.senzing` in your renderer code.
+
+See [packages/electron/](packages/electron/) for the full implementation and [packages/electron/example/](packages/electron/example/) for a working demo app.
+
 ## API Reference
 
 ### @senzing/sdk
@@ -161,6 +236,16 @@ All functions are stateless: they accept a config JSON string and return a modif
 | Script Processing  | `processScript`, `processFile`                                                                                               |
 
 Full type definitions are in `packages/configtool/index.d.ts`.
+
+### @senzing/electron
+
+| Export (from subpath)       | Description                                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `@senzing/electron/main`    | `SzElectronMain` class. Call `setup()` in `app.whenReady()` to register IPC handlers. Call `teardown()` on quit. |
+| `@senzing/electron/preload` | Import in your preload script to expose `window.senzing` via `contextBridge`.                                 |
+| `@senzing/electron/renderer`| TypeScript declarations for `window.senzing` (types only, no runtime code).                                   |
+
+The renderer API mirrors `@senzing/sdk` but all methods are `async` (IPC is inherently async). A data-driven method registry means adding a new SDK method requires only one line of code.
 
 ## SzFlags
 
@@ -363,6 +448,27 @@ sz-napi/
       js/                       # JS error mapping and wrapper
       npm/                      # Platform-specific packages
       __tests__/
+    electron/                   # @senzing/electron
+      package.json
+      tsconfig.json
+      PLAN.md                   # Architecture and design document
+      src/
+        main/
+          index.ts              # SzElectronMain: IPC handlers, worker management
+          worker.ts             # Worker thread: owns SzEnvironment, dispatches SDK calls
+        preload/
+          index.ts              # contextBridge.exposeInMainWorld('senzing', api)
+        renderer/
+          types.ts              # TypeScript declarations for window.senzing
+        shared/
+          channels.ts           # METHOD_REGISTRY: all SDK methods + IPC channels
+          protocol.ts           # WorkerRequest/WorkerResponse/IpcEnvelope types
+          errors.ts             # Serialize/deserialize SzError across IPC
+          flags.ts              # BigInt conversion helpers
+      example/
+        main.ts                 # Minimal Electron app
+        preload.ts              # One-liner import
+        index.html              # Demo UI: init, add record, search, version
   examples/
     basic-sdk-usage/            # Load records, search, get entities
     config-management/          # Register data sources, manage configs
